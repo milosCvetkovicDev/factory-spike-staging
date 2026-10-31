@@ -21,7 +21,10 @@ try {
   let reason = null
   if (ruleDeny) reason = ruleDeny
   else if (input === null) reason = 'factory-spike: unreadable hook input; failing closed'
-  else if (!res.ok) reason = 'factory-spike: control plane unreachable, slow or invalid; failing closed'
+  else if (!res.ok) {
+    const cause = `${res.error || 'unknown cause'}${res.target ? `; POST ${res.target}` : ''}`
+    reason = `factory-spike: control plane unreachable, slow or invalid (${cause}); failing closed`
+  }
   else if (res.json.stop === true) reason = 'factory-spike: the packet call budget is used up'
   else if (res.json.stop !== false) reason = 'factory-spike: control plane answer has no stop flag; failing closed'
   if (reason) output = deny(reason)

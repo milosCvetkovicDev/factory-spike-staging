@@ -1,6 +1,8 @@
 // Shared helpers for the fixture's guard hooks. Dependency-free, and importing this module has no side
 // effects: every hook calls isRemote(process.env) before it touches a file or the network.
-import { appendFileSync, mkdirSync, readFileSync, writeSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, writeSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 // True only inside a cloud session.
@@ -84,42 +86,160 @@ export function bashRule(command) {
   return null
 }
 
-// POST to the control plane. ok is true only for a 2xx answer with a JSON object body. Never throws.
-// status is the HTTP status, or null with error saying why there was no answer.
-// The token goes in a header when FACTORY_CP_TOKEN is set; otherwise the network layer may add it.
+// The control-plane base from FACTORY_CP_URL: an http(s) URL without credentials, query or fragment, so
+// the host and path a deny reason names carry nothing secret.
+function controlPlaneUrl(raw) {
+  if (typeof raw !== 'string' || raw === '') return { error: 'no-url: FACTORY_CP_URL is unset' }
+  let u = null
+  try {
+    u = new URL(raw)
+  } catch {
+    u = null
+  }
+  if (u === null || (u.protocol !== 'http:' && u.protocol !== 'https:') || u.username !== '' || u.password !== '' || /[?#]/.test(raw)) {
+    return { error: 'no-url: FACTORY_CP_URL is not a plain http(s) URL' }
+  }
+  const prefix = u.pathname.replace(/\/+$/, '')
+  return { base: u.origin + prefix, target: u.host + prefix }
+}
+
+// True when text holds the token or any 8-byte slice of it (the whole token when it is shorter).
+function holdsTokenPart(text, token) {
+  if (token === '') return false
+  const n = Math.min(8, token.length)
+  for (let i = 0; i + n <= token.length; i++) if (text.includes(token.slice(i, i + n))) return true
+  return false
+}
+
+// curl's own error line ("curl: (7) Failed to connect ..."), the last one, as printable ASCII of at most 200
+// characters, with any user:password@ removed. A line that holds any part of the token is withheld.
+function curlLine(stderr, token) {
+  const line = stderr.split('\n').map((l) => l.trim()).reverse().find((l) => /^curl: \(\d+\) /.test(l))
+  if (line === undefined) return 'no error line'
+  const text = line.replace(/^curl: \(\d+\) /, '').replace(/[^\x20-\x7e]/g, ' ')
+    .replace(/[^\s/@]+:[^\s/@]*@/g, '[credentials]@').slice(0, 200)
+  return holdsTokenPart(line, token) || holdsTokenPart(text, token) ? 'error line withheld (it held part of the token)' : text
+}
+
+// The environment for a child: without any FACTORY_CP_ variable and without any variable whose value holds
+// the token, so an alias such as an OTLP header variable does not carry it either.
+export function envWithout(env, token = typeof env.FACTORY_CP_TOKEN === 'string' ? env.FACTORY_CP_TOKEN : '') {
+  return Object.fromEntries(Object.entries(env)
+    .filter(([key, value]) => !key.startsWith('FACTORY_CP_') && !(token !== '' && String(value).includes(token))))
+}
+
+const ANSWER_MAX = 1048576
+
+function removeDir(dir) {
+  if (dir === null) return
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch {
+    // a leftover body file holds no token; the post's answer stands
+  }
+}
+
+// POST to the control plane through curl, which honours the proxy variables and the system CA store of a
+// cloud session; Node's fetch honours neither (spike/FACTS.md). ok is true only for a 2xx answer with a
+// JSON object body. Never throws. status is the HTTP status or null. When ok is false, error names the
+// cause with safe facts only: no-url, bad-token, temp file failed, curl not started, curl killed,
+// curl exit <n>: <curl's error line> or http <status>; target is host and path once the URL is usable.
+// The token goes to curl on stdin (-H @-), never in its argv or environment, and no error carries any part
+// of it; without FACTORY_CP_TOKEN no header is sent and the network layer may add it.
 export async function post(path, body, { env = process.env, timeoutMs = 2000 } = {}) {
   const started = performance.now()
+  const url = controlPlaneUrl(env.FACTORY_CP_URL)
+  const target = url.error ? null : url.target + String(path).split(/[?#]/)[0]
   const done = (ok, json, status = null, error = null) =>
-    ({ ok, json, status, error, ms: Math.round((performance.now() - started) * 10) / 10 })
-  const base = typeof env.FACTORY_CP_URL === 'string' ? env.FACTORY_CP_URL.replace(/\/+$/, '') : ''
-  if (base === '') return done(false, null, null, 'no control-plane URL')
+    ({ ok, json, status, error, target, ms: Math.round((performance.now() - started) * 10) / 10 })
+  if (url.error) return done(false, null, null, url.error)
+  const token = typeof env.FACTORY_CP_TOKEN === 'string' ? env.FACTORY_CP_TOKEN : ''
+  if (token !== '' && !/^[\x21-\x7e]+$/.test(token)) return done(false, null, null, 'bad-token: FACTORY_CP_TOKEN is not a header-safe value')
   const isText = typeof body === 'string'
-  const headers = { 'content-type': isText ? 'application/x-ndjson' : 'application/json' }
-  if (env.FACTORY_CP_TOKEN) headers.authorization = `Bearer ${env.FACTORY_CP_TOKEN}`
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), timeoutMs)
-  let status = null
+  let dir = null
+  let bodyFile = null
   try {
-    const res = await fetch(base + path, {
-      method: 'POST',
-      headers,
-      body: isText ? body : JSON.stringify(body),
-      signal: controller.signal,
+    dir = mkdtempSync(join(tmpdir(), 'factory-spike-post-'))
+    bodyFile = join(dir, 'body')
+    writeFileSync(bodyFile, isText ? body : JSON.stringify(body), { mode: 0o600 })
+  } catch (e) {
+    removeDir(dir)
+    return done(false, null, null, `temp file failed: ${(e && e.code) || 'error'}`)
+  }
+  try {
+    // -q first, so a ~/.curlrc cannot change the request; the connect timeout sits inside --max-time;
+    // --globoff keeps [ ] in the URL from expanding into several requests.
+    const args = ['-q', '--silent', '--show-error', '--globoff', '--proto', '=http,https',
+      '--max-time', String(timeoutMs / 1000), '--connect-timeout', String(Math.round(timeoutMs * 0.75) / 1000),
+      '--max-filesize', String(ANSWER_MAX),
+      '--header', `content-type: ${isText ? 'application/x-ndjson' : 'application/json'}`, '--header', 'Expect:',
+      '--data-binary', `@${bodyFile}`, '--write-out', '\n%{http_code}']
+    if (token !== '') args.push('--header', '@-')
+    args.push('--url', url.base + path)
+    // curl gets the hook's environment without the token (envWithout), in the C locale, so --connect-timeout 1.5
+    // parses the same everywhere and the error line is in English.
+    const childEnv = { ...envWithout(env, token), LC_ALL: 'C' }
+    const run = await new Promise((resolve) => {
+      const out = []
+      const err = []
+      let settled = false
+      let killer = null
+      const finish = (r) => {
+        if (settled) return
+        settled = true
+        clearTimeout(killer)
+        resolve(r)
+      }
+      let child
+      try {
+        child = spawn('curl', args, { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] })
+      } catch (e) {
+        return finish({ spawnError: (e && e.code) || 'error' })
+      }
+      // A curl that outlives --max-time, or answers more than ANSWER_MAX, is killed, and the post gives up
+      // at once, even if a grandchild still holds the pipes.
+      const kill = (why) => {
+        child.kill('SIGKILL')
+        child.stdout.destroy()
+        child.stderr.destroy()
+        finish({ code: null, signal: 'SIGKILL', why })
+      }
+      killer = setTimeout(() => kill(''), timeoutMs + 1000)
+      let bytes = 0
+      const collect = (into) => (c) => {
+        bytes += c.length
+        if (bytes > ANSWER_MAX + 4096) kill(' (answer over 1 MiB)')
+        else into.push(c)
+      }
+      child.on('error', (e) => finish({ spawnError: (e && e.code) || 'error' }))
+      child.stdout.on('error', () => {})
+      child.stderr.on('error', () => {})
+      child.stdout.on('data', collect(out))
+      child.stderr.on('data', collect(err))
+      child.on('close', (code, signal) =>
+        finish({ code, signal, stdout: Buffer.concat(out).toString('utf8'), stderr: Buffer.concat(err).toString('utf8') }))
+      child.stdin.on('error', () => {})
+      child.stdin.end(token !== '' ? `Authorization: Bearer ${token}\n` : '')
     })
-    status = res.status
-    const text = await res.text()
+    if (run.spawnError) return done(false, null, null, `curl not started: ${run.spawnError}`)
+    if (run.code === null) return done(false, null, null, `curl killed by ${run.signal}${run.why || ''}`)
+    if (run.code !== 0) return done(false, null, null, `curl exit ${run.code}: ${curlLine(run.stderr, token)}`)
+    const nl = run.stdout.lastIndexOf('\n')
+    const status = Number(run.stdout.slice(nl + 1))
+    if (nl < 0 || !Number.isInteger(status) || status < 100 || status > 599) return done(false, null, null, 'curl exit 0: no HTTP status')
+    if (status < 200 || status > 299) return done(false, null, status, `http ${status}`)
     let json = null
     try {
-      const value = JSON.parse(text)
+      const value = JSON.parse(run.stdout.slice(0, nl))
       if (value && typeof value === 'object' && !Array.isArray(value)) json = value
     } catch {
       json = null
     }
-    return done(res.ok && json !== null, json, status)
-  } catch {
-    return done(false, null, status, controller.signal.aborted ? `timeout after ${timeoutMs} ms` : 'request failed')
+    return json === null ? done(false, null, status, `http ${status}: not a JSON object`) : done(true, json, status)
+  } catch (e) {
+    return done(false, null, null, `curl not started: ${(e && e.code) || 'error'}`)
   } finally {
-    clearTimeout(timer)
+    removeDir(dir)
   }
 }
 

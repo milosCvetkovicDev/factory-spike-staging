@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { isRemote, readInput, post, postEvent, sessionOf, projectDir, stateDir, writeErr } from './lib.mjs'
+import { isRemote, readInput, post, postEvent, sessionOf, projectDir, stateDir, writeErr, envWithout } from './lib.mjs'
 
 if (!isRemote(process.env)) process.exit(0)
 
@@ -38,15 +38,16 @@ if (typeof input.transcript_path === 'string' && input.transcript_path !== '') {
 }
 
 // The test script is repository code the agent wrote: it gets the environment without any FACTORY_CP_*
-// variable, so the control-plane URL and token stay with the hook's own posts.
+// variable and without any value that holds the token, so the control-plane URL and token stay with the
+// hook's own posts. git gets the same environment.
 const STOP_CMD = 'npm test'
-const testEnv = Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('FACTORY_CP_')))
+const testEnv = envWithout(env)
 const run = spawnSync('npm', ['test'], { cwd: dir, env: testEnv, timeout: 50000, maxBuffer: 64 * 1024 * 1024 })
 const stopExit = typeof run.status === 'number' ? run.status : 1
 const output = Buffer.concat([run.stdout || Buffer.alloc(0), run.stderr || Buffer.alloc(0)])
 
 const git = (...args) => {
-  const r = spawnSync('git', args, { cwd: dir, encoding: 'utf8' })
+  const r = spawnSync('git', args, { cwd: dir, env: testEnv, encoding: 'utf8' })
   return r.status === 0 ? r.stdout.trim().split('\n')[0] : null
 }
 const baseSha = git('merge-base', 'HEAD', 'origin/main') || git('rev-list', '--max-parents=0', 'HEAD')
