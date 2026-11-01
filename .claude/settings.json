@@ -17,22 +17,11 @@
     "UserPromptSubmit": [
       { "hooks": [{ "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/prompt.mjs" }] }
     ],
-    "PreToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          { "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-tool.mjs", "onFailure": "block" }
-        ]
-      }
-    ],
     "Notification": [
       { "matcher": "permission_prompt|elicitation_dialog|elicitation_url_dialog", "hooks": [{ "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/notification.mjs" }] }
     ],
     "ConfigChange": [
       { "hooks": [{ "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/config-change.mjs" }] }
-    ],
-    "Stop": [
-      { "hooks": [{ "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR\"/.claude/hooks/stop.mjs" }] }
     ]
   }
 }
